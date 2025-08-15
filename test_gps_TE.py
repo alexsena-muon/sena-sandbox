@@ -493,33 +493,31 @@ def gps(name, output, running, lock, nice):
     while running.is_set():
         try:
             print(f"[{name}] INFO: Starting GPS test cycle.")
-            with serial.Serial(port="/dev/ttyLP1", baudrate=9600, write_timeout=1, timeout=0) as ser:
-                ser.baudrate = 9600
-                set_gps_reset(lock, reset=False)
-                set_gps_power(lock, power=False)
-                set_osc_power(lock, power=False)
-                time.sleep(10)
-                _ = ser.read(256)
-                print(f"[{name}] INFO: Powering on GPS...")
-                check_report()
+            with serial.Serial(port="/dev/ttyLP1", baudrate=GPS_BAUDRATE, write_timeout=1, timeout=0) as ser:
+                ser.setRTS(True)
+                print(f"[{name}] INFO: Powering on GPS and oscillator...")
                 set_gps_reset(lock, reset=False)
                 set_gps_power(lock, power=True)
                 set_osc_power(lock, power=True)
                 data["POWER_CYCLES"] += 1
+
                 if not wait_for_gps_ready(ser):
                     print(f"[{name}] FAILED: GPS did not become ready. Retrying.")
                     continue
+
                 print(f"[{name}] INFO: Performing reset...")
                 time.sleep(1)
                 set_gps_reset(lock, reset=True)
                 time.sleep(1)
                 set_gps_reset(lock, reset=False)
                 data["RESETS"] += 1
+
                 if not wait_for_gps_ready(ser):
                     print(f"[{name}] FAILED: GPS did not become ready after reset. Retrying.")
                     continue
+
                 log_buffer = bytearray()
-                print(f"[{name}] INFO: Requesting VERSIONA log at 9600 baud...")
+                print(f"[{name}] INFO: Requesting VERSIONA log...")
                 list(gps_command(ser, "LOG", "THISPORT", "VERSIONA", "ONCE", "0.0", "0.0", "NOHOLD"))
                 have_version = False
                 for log in yield_logs(ser, timeout=2):
@@ -527,26 +525,11 @@ def gps(name, output, running, lock, nice):
                     have_version = have_version or log.split(",")[0] == "VERSIONA"
                 if not have_version:
                     data["BOOT_TIMEOUTS"] += 1
-                    print(f"[{name}] FAILED: No VERSIONA log received at 9600 baud. Retrying.")
+                    print(f"[{name}] FAILED: No VERSIONA log received. Retrying.")
                     continue
-                print(f"[{name}] INFO: Successfully received VERSIONA. Changing baudrate to {GPS_BAUDRATE}...")
+                
+                print(f"[{name}] SUCCESS: GPS communication is stable. Requesting telemetry...")
                 list(gps_command(ser, "SERIALCONFIG", "THISPORT", str(GPS_BAUDRATE), "N", "8", "1", "N", "ON"))
-                time.sleep(0.100)
-                ser.baudrate = GPS_BAUDRATE
-                ser.setRTS(True)
-                _ = ser.read(256)
-                log_buffer = bytearray()
-                print(f"[{name}] INFO: Requesting VERSIONA log at new baudrate...")
-                list(gps_command(ser, "LOG", "THISPORT", "VERSIONA", "ONCE", "0.0", "0.0", "NOHOLD"))
-                have_version = False
-                for log in yield_logs(ser, timeout=2):
-                    if log is None: break
-                    have_version = have_version or log.split(",")[0] == "VERSIONA"
-                if not have_version:
-                    data["BOOT_TIMEOUTS"] += 1
-                    print(f"[{name}] FAILED: No VERSIONA log received at {GPS_BAUDRATE} baud. Retrying.")
-                    continue
-                print(f"[{name}] SUCCESS: GPS communication is stable at {GPS_BAUDRATE} baud. Requesting telemetry...")
                 listen_expire = time.monotonic() + GPS_LISTEN_TIME
                 command_expire = time.monotonic() + GPS_COMMAND_INTERVAL
                 for log in gps_command(ser, "LOG", "THISPORT", "HWMONITORA", "ONTIME", "1.0", "0.0", "NOHOLD"): process_log(log)
