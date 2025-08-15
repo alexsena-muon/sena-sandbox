@@ -772,9 +772,9 @@ def gps(name, output, running, lock, nice):
 
     while running.is_set():
         with serial.Serial(
-            port="/dev/ttyLP1", baudrate=96000, write_timeout=1, timeout=0
+            port="/dev/ttyLP1", baudrate=230400, write_timeout=1, timeout=0
         ) as ser:
-            ser.baudrate = 96000
+            ser.baudrate = 230400
             set_gps_reset(lock, reset=False)
             set_gps_power(lock, power=False)
 
@@ -1052,3 +1052,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
