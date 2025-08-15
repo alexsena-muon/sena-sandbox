@@ -51,6 +51,7 @@ def uptime(name, output, running, lock, nice):
             send_data(name, output, data)
         except Exception as e:
             output.put(f"{name}_ERROR: Failed to read system info: {str(e)}")
+            print(f"[{name}] ERROR: Failed to read system info: {str(e)}")
         time.sleep(15)
 
 ######################################################################
@@ -324,11 +325,13 @@ def gps(name, output, running, lock, nice):
             ser.timeout = timeout
             b = ser.read(256)
             if not b:
+                 print(f"[{name}] WARNING: Serial read timed out or returned no data.")
                  raise serial.SerialException("Read timed out or returned no data.")
             data["BYTES_RX"] += len(b)
             buf.extend(b)
         except serial.SerialException as e:
             output.put(f"GPS_ERROR ser_read_into: {str(e)}")
+            print(f"[{name}] ERROR: Serial read failed with exception: {str(e)}")
             raise
     
     def ser_write(ser, buf):
@@ -339,17 +342,21 @@ def gps(name, output, running, lock, nice):
     def wait_for_gps_ready(ser):
         buf = bytearray()
         expire = time.monotonic() + GPS_BOOT_TIMEOUT
+        print(f"[{name}] INFO: Waiting for GPS ready message...")
         while running.is_set():
             check_report()
             try:
                 ser_read_into(ser, buf, timeout=1.0)
             except serial.SerialException:
+                print(f"[{name}] WARNING: Serial read failed during wait_for_gps_ready. Restarting sequence.")
                 return False
 
             if buf.endswith(f"[COM{GPS_COM_PORT}]".encode()):
+                print(f"[{name}] SUCCESS: GPS ready message received!")
                 return True
             if time.monotonic() > expire:
                 data["BOOT_TIMEOUTS"] += 1
+                print(f"[{name}] FAILED: GPS boot timed out.")
                 return False
 
     log_buffer = bytearray()
@@ -358,6 +365,7 @@ def gps(name, output, running, lock, nice):
         expire = time.monotonic() + timeout
         while running.is_set():
             if time.monotonic() > expire:
+                print(f"[{name}] WARNING: Yield logs timed out.")
                 raise TimeoutError("Yield logs timed out.")
             
             try:
@@ -386,9 +394,11 @@ def gps(name, output, running, lock, nice):
                         data["RX_ERRS"] += 1
                         output.put(f"GPS_ERROR CRC_ERR:1")
                         output.put(f"GPS_ERROR RX_DETAILS:{str(e)}")
+                        print(f"[{name}] WARNING: Corrupted message received, skipping. Error: {str(e)}")
                         return
 
     def gps_command(ser, command, *args, expect_reply=True):
+        print(f"[{name}] INFO: Sending command: {command}...")
         port = "THISPORT"; seq = "0"; idle = "0"; tstatus = "UNKNOWN"; week = "0"
         second = "0.0"; rstatus = "0"; reserved = "0"; version = "0"
         cstr = (f"{command}A,{port},{seq},{idle},{tstatus},{week},{second},{rstatus}"
@@ -397,10 +407,13 @@ def gps(name, output, running, lock, nice):
         ser_write(ser, msg)
 
         if expect_reply:
+            print(f"[{name}] INFO: Waiting for reply to command...")
             for log in yield_logs(ser, timeout=1.0):
                 if log is None:
+                    print(f"[{name}] WARNING: No logs received after command. Assuming failure.")
                     return
                 if log.split(",")[0] == command + "R":
+                    print(f"[{name}] SUCCESS: Reply to {command} received.")
                     return
                 else:
                     yield log
@@ -479,6 +492,7 @@ def gps(name, output, running, lock, nice):
 
     while running.is_set():
         try:
+            print(f"[{name}] INFO: Starting GPS test cycle.")
             with serial.Serial(port="/dev/ttyLP1", baudrate=9600, write_timeout=1, timeout=0) as ser:
                 ser.baudrate = 9600
                 set_gps_reset(lock, reset=False)
@@ -486,26 +500,26 @@ def gps(name, output, running, lock, nice):
                 set_osc_power(lock, power=False)
                 time.sleep(10)
                 _ = ser.read(256)
-
+                print(f"[{name}] INFO: Powering on GPS...")
                 check_report()
                 set_gps_reset(lock, reset=False)
                 set_gps_power(lock, power=True)
                 set_osc_power(lock, power=True)
                 data["POWER_CYCLES"] += 1
-
                 if not wait_for_gps_ready(ser):
+                    print(f"[{name}] FAILED: GPS did not become ready. Retrying.")
                     continue
-
+                print(f"[{name}] INFO: Performing reset...")
                 time.sleep(1)
                 set_gps_reset(lock, reset=True)
                 time.sleep(1)
                 set_gps_reset(lock, reset=False)
                 data["RESETS"] += 1
-
                 if not wait_for_gps_ready(ser):
+                    print(f"[{name}] FAILED: GPS did not become ready after reset. Retrying.")
                     continue
-
                 log_buffer = bytearray()
+                print(f"[{name}] INFO: Requesting VERSIONA log at 9600 baud...")
                 list(gps_command(ser, "LOG", "THISPORT", "VERSIONA", "ONCE", "0.0", "0.0", "NOHOLD"))
                 have_version = False
                 for log in yield_logs(ser, timeout=2):
@@ -513,16 +527,16 @@ def gps(name, output, running, lock, nice):
                     have_version = have_version or log.split(",")[0] == "VERSIONA"
                 if not have_version:
                     data["BOOT_TIMEOUTS"] += 1
+                    print(f"[{name}] FAILED: No VERSIONA log received at 9600 baud. Retrying.")
                     continue
-                
-                # Add hardware flow control
+                print(f"[{name}] INFO: Successfully received VERSIONA. Changing baudrate to {GPS_BAUDRATE}...")
                 list(gps_command(ser, "SERIALCONFIG", "THISPORT", str(GPS_BAUDRATE), "N", "8", "1", "N", "ON"))
                 time.sleep(0.100)
                 ser.baudrate = GPS_BAUDRATE
                 ser.setRTS(True)
                 _ = ser.read(256)
                 log_buffer = bytearray()
-                
+                print(f"[{name}] INFO: Requesting VERSIONA log at new baudrate...")
                 list(gps_command(ser, "LOG", "THISPORT", "VERSIONA", "ONCE", "0.0", "0.0", "NOHOLD"))
                 have_version = False
                 for log in yield_logs(ser, timeout=2):
@@ -530,35 +544,33 @@ def gps(name, output, running, lock, nice):
                     have_version = have_version or log.split(",")[0] == "VERSIONA"
                 if not have_version:
                     data["BOOT_TIMEOUTS"] += 1
+                    print(f"[{name}] FAILED: No VERSIONA log received at {GPS_BAUDRATE} baud. Retrying.")
                     continue
-
+                print(f"[{name}] SUCCESS: GPS communication is stable at {GPS_BAUDRATE} baud. Requesting telemetry...")
                 listen_expire = time.monotonic() + GPS_LISTEN_TIME
                 command_expire = time.monotonic() + GPS_COMMAND_INTERVAL
-                
                 for log in gps_command(ser, "LOG", "THISPORT", "HWMONITORA", "ONTIME", "1.0", "0.0", "NOHOLD"): process_log(log)
                 for log in gps_command(ser, "LOG", "THISPORT", "BESTSATSA", "ONTIME", "1.0", "0.0", "NOHOLD"): process_log(log)
                 for log in gps_command(ser, "LOG", "THISPORT", "BESTXYZA", "ONTIME", "1.0", "0.0", "NOHOLD"): process_log(log)
                 for log in gps_command(ser, "LOG", "THISPORT", "CLOCKSTEERINGA", "ONTIME", "1.0", "0.0", "NOHOLD"): process_log(log)
                 for log in gps_command(ser, "LOG", "THISPORT", "CLOCKMODELA", "ONTIME", "1.0", "0.0", "NOHOLD"): process_log(log)
-
                 list(gps_command(ser, "EXTERNALCLOCK", "USER", "10MHZ", "1.0e-35", "1.0e-35", "1.0e-35"))
                 list(gps_command(ser, "CLOCKCALIBRATE", "SET", "4400", "2400", "0.08", "0.01"))
-                
                 while running.is_set() and time.monotonic() < listen_expire:
                     for log in yield_logs(ser, timeout=3):
                         if log is None: break
                         process_log(log)
-                    
                     if time.monotonic() > command_expire:
                         for log in gps_command(ser, "LOG", "THISPORT", "VERSIONA", "ONCE", "0.0", "0.0", "NOHOLD"):
                             process_log(log)
                         command_expire = time.monotonic() + GPS_COMMAND_INTERVAL
-        
         except serial.SerialException as e:
             output.put(f"GPS_FATAL_SERIAL_ERROR: {str(e)}")
+            print(f"[{name}] FATAL ERROR: Serial port exception: {str(e)}")
             time.sleep(5)
         except Exception as e:
             output.put(f"GPS_UNHANDLED_ERROR: {str(e)}")
+            print(f"[{name}] UNHANDLED ERROR: {str(e)}")
             time.sleep(5)
 
 ######################################################################
