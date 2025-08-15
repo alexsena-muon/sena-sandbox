@@ -57,8 +57,163 @@ def uptime(name, output, running, lock, nice):
 #                   BOARDMON
 ######################################################################
 
-# (The BOARDMON section remains the same. It's not included here for brevity,
-# but assume it's correctly pasted from the original test.py)
+# INA3221 has 3 shunt/bus voltage pairs.
+INA3221_PAIRS = [(0x01, 0x02), (0x03, 0x04), (0x05, 0x06)]
+
+def ina3221_voltage(bus_reg):
+    return (bus_reg >> 3) * 0.008
+
+def ina3221_current(shunt_reg, shunt_resistance):
+    shunt_voltage = (shunt_reg >> 3) * 40e-6
+    return shunt_voltage / shunt_resistance
+
+def ina3221(bus, address, *channel_names_and_shunt_resistances, init=False):
+    if init:
+        return
+    data = {}
+    for (name, shunt_resistance), (shunt_voltage_reg, bus_voltage_reg) in zip(
+        channel_names_and_shunt_resistances, INA3221_PAIRS
+    ):
+        shunt_write = i2c_msg.write(address, [shunt_voltage_reg])
+        shunt_read = i2c_msg.read(address, 2)
+        bus_write = i2c_msg.write(address, [bus_voltage_reg])
+        bus_read = i2c_msg.read(address, 2)
+        bus.i2c_rdwr(shunt_write, shunt_read)
+        bus.i2c_rdwr(bus_write, bus_read)
+        (shunt_reg,) = struct.unpack(">h", shunt_read.buf[: shunt_read.len])
+        (bus_reg,) = struct.unpack(">h", bus_read.buf[: bus_read.len])
+        data[f"{name}_V"] = "{:.3f}".format(ina3221_voltage(bus_reg))
+        data[f"{name}_A"] = "{:.3f}".format(ina3221_current(shunt_reg, shunt_resistance))
+    return data
+
+DEG_C_TO_DEG_K = 273.15
+
+def at30ts75a_temperature(temp_reg):
+    temp_milli_deg_c = (temp_reg >> 4) * 62.5
+    return (temp_milli_deg_c + DEG_C_TO_DEG_K * 1000) / 1000
+
+def at30ts75a(bus, address, sensor_name, init=False):
+    if init:
+        conf_write = i2c_msg.write(address, [0x01, 0x60, 0x00])
+        bus.i2c_rdwr(conf_write)
+        return
+    temp_write = i2c_msg.write(address, [0x0])
+    temp_read = i2c_msg.read(address, 2)
+    bus.i2c_rdwr(temp_write, temp_read)
+    (temp_reg,) = struct.unpack(">h", temp_read.buf[: temp_read.len])
+    data = {}
+    data[sensor_name] = at30ts75a_temperature(temp_reg)
+    return data
+
+def ltc2946_voltage(bus_reg):
+    return (bus_reg >> 4) * 0.025
+
+def ltc2946_current(shunt_reg, shunt_resistance):
+    return (shunt_reg >> 4) * (25e-6 / shunt_resistance)
+
+def ltc2946_power(power_reg, shunt_resistance):
+    return power_reg * (6.25e-7 / shunt_resistance)
+
+def ltc2946_adin(adin_reg):
+    return (adin_reg >> 4) * 0.5e-3
+
+def ltc2946(bus, address, name, shunt_resistance, adin_name, adin_gain, init=False):
+    if init:
+        if adin_name is None:
+            conf_write = i2c_msg.write(address, [0x0, 0x18])
+        else:
+            conf_write = i2c_msg.write(address, [0x0, 0x1B])
+        bus.i2c_rdwr(conf_write)
+        return
+    data = {}
+    shunt_write = i2c_msg.write(address, [0x14])
+    shunt_read = i2c_msg.read(address, 2)
+    bus_write = i2c_msg.write(address, [0x1E])
+    bus_read = i2c_msg.read(address, 2)
+    power_write = i2c_msg.write(address, [0x05])
+    power_read = i2c_msg.read(address, 3)
+    bus.i2c_rdwr(shunt_write, shunt_read)
+    bus.i2c_rdwr(bus_write, bus_read)
+    bus.i2c_rdwr(power_write, power_read)
+    (shunt_reg,) = struct.unpack(">H", shunt_read.buf[: shunt_read.len])
+    (bus_reg,) = struct.unpack(">H", bus_read.buf[: bus_read.len])
+    (power_reg,) = struct.unpack(">I", power_read.buf[: power_read.len] + b"\x00")
+    power_reg >>= 8
+    data[f"{name}_V"] = "{:.3f}".format(ltc2946_voltage(bus_reg))
+    data[f"{name}_A"] = "{:.3f}".format(ltc2946_current(shunt_reg, shunt_resistance))
+    data[f"{name}_P"] = "{:.3f}".format(ltc2946_power(power_reg, shunt_resistance))
+    if adin_name is not None:
+        adin_write = i2c_msg.write(address, [0x28])
+        adin_read = i2c_msg.read(address, 2)
+        bus.i2c_rdwr(adin_write, adin_read)
+        (adin_reg,) = struct.unpack(">H", adin_read.buf[: adin_read.len])
+        data[adin_name] = "{:.3f}".format(ltc2946_adin(adin_reg) * adin_gain)
+    return data
+
+SENSOR_CYCLE_TIME = 1
+HEATER_FORCE_ON_TIME = 3
+HEATER_CYCLE_TIME = 240
+
+SENSORS = [
+    (0x40, ina3221, (("VDD_1V0_AUX", 0.05), ("VDD_2V5_AUX", 0.05), ("VDD_3V3_GPS", 0.05))),
+    (0x41, ina3221, (("VDD_3V3_M2M", 0.01), ("VDD_3V3_M2M2", 0.01))),
+    (0x48, at30ts75a, ("TEMP0",)),
+    (0x49, at30ts75a, ("TEMP1",)),
+    (0x4A, at30ts75a, ("TEMP2",)),
+    (0x4B, at30ts75a, ("TEMP3",)),
+    (0x6A, ltc2946, ("VDD_28V0_TTCFE0", 0.02, "VDD_28V0_TTCFE0_V", 16.8)),
+    (0x6B, ltc2946, ("VDD_28V0_TTCFE1", 0.02, "VDD_28V0_TTCFE1_V", 16.8)),
+    (0x6C, ltc2946, ("VDD_28V0_HSIO", 0.02, "VDD_5V0_HSIO_V", 3)),
+    (0x6D, ltc2946, ("VDD_28V0_MFC", 0.02, "VDD_5V0_V", 3)),
+]
+
+def board_heater_enable(enable):
+    gpio_set("HEAT_EN", enable)
+
+def board_id():
+    board_id = 0
+    return board_id
+
+def board_mon(name, output, running, lock, nice):
+    set_scheduler(nice)
+    bus = SMBus(16)
+    board_heater_enable(False)
+    heater_timer = time.monotonic()
+    def board_heater(data):
+        nonlocal heater_timer
+        now = time.monotonic()
+        time_since_last_force = now - heater_timer
+        heater_force_state = time_since_last_force < HEATER_FORCE_ON_TIME
+        if time_since_last_force > HEATER_CYCLE_TIME:
+            heater_timer += HEATER_CYCLE_TIME
+        min_temp = min(float(data["TEMP{}".format(i)]) for i in range(4))
+        min_temp -= DEG_C_TO_DEG_K
+        heater_enable = (min_temp < 0) or heater_force_state
+        board_heater_enable(heater_enable)
+        data["HEATER_EN"] = int(heater_enable)
+    for sensor, sensor_function, args in SENSORS:
+        sensor_function(bus, sensor, *args, init=True)
+    heater_timer = time.monotonic()
+    prev = time.monotonic()
+    try:
+        while running.is_set():
+            data = {}
+            for sensor, sensor_function, args in SENSORS:
+                data.update(sensor_function(bus, sensor, *args))
+            board_heater(data)
+            data["BOARD_ID"] = board_id()
+            now = time.monotonic()
+            sleep_time = max((prev + SENSOR_CYCLE_TIME) - now, 0.0)
+            data["idle"] = "{:.3}".format(sleep_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                prev += SENSOR_CYCLE_TIME
+            else:
+                prev = now
+            data_string = " ".join("{}:{}".format(key, data[key]) for key in sorted(data))
+            output.put(f"{name} {data_string}")
+    finally:
+        board_heater_enable(False)
 
 ######################################################################
 #                   PWR_SW
@@ -74,22 +229,22 @@ SWITCH_TOGGLE_INTERVAL = 5 * 60
 def power_toggle(name, output, running, lock, nice):
     for switch_name, pin_name in POWER_ENABLES:
         gpio_set(pin_name, False)
-    
     switch_state = [False for _ in POWER_ENABLES]
-    data = {switch_name: 0 for switch_name, _ in POWER_ENABLES}
+    data = {}
+    for switch_name, _ in POWER_ENABLES:
+        data[switch_name] = 0
     toggle_index = 0
-
     try:
         while running.is_set():
             time.sleep(SWITCH_TOGGLE_INTERVAL)
             switch_state[toggle_index] = not switch_state[toggle_index]
             toggle_index = (toggle_index + 1) % len(POWER_ENABLES)
-
             with lock:
-                for (switch_name, pin_name), enabled in zip(POWER_ENABLES, switch_state):
+                for (switch_name, pin_name), enabled in zip(
+                    POWER_ENABLES, switch_state
+                ):
                     gpio_set(pin_name, enabled)
                     data[switch_name] = int(enabled)
-            
             send_data(name, output, data)
     finally:
         with lock:
@@ -189,7 +344,6 @@ def gps(name, output, running, lock, nice):
             try:
                 ser_read_into(ser, buf, timeout=1.0)
             except serial.SerialException:
-                # If read fails, break and let the outer loop handle the restart
                 return False
 
             if buf.endswith(f"[COM{GPS_COM_PORT}]".encode()):
@@ -232,9 +386,7 @@ def gps(name, output, running, lock, nice):
                         data["RX_ERRS"] += 1
                         output.put(f"GPS_ERROR CRC_ERR:1")
                         output.put(f"GPS_ERROR RX_DETAILS:{str(e)}")
-                        # Do not continue, yield from the function to trigger a full restart
                         return
-
 
     def gps_command(ser, command, *args, expect_reply=True):
         port = "THISPORT"; seq = "0"; idle = "0"; tstatus = "UNKNOWN"; week = "0"
@@ -246,7 +398,7 @@ def gps(name, output, running, lock, nice):
 
         if expect_reply:
             for log in yield_logs(ser, timeout=1.0):
-                if log is None: # Propagate error from yield_logs
+                if log is None:
                     return
                 if log.split(",")[0] == command + "R":
                     return
@@ -255,16 +407,12 @@ def gps(name, output, running, lock, nice):
 
     systems = set()
     def process_log(log):
-        # ... (rest of the process_log function remains the same, assuming it's correctly pasted)
         nonlocal data
         nonlocal systems
         log_name = log.split(",")[0]
-
         key = "NUM_{}".format(log_name)
         data[key] = data.get(key, 0) + 1
-
         parts = log.split(";")[1].split(",")
-
         if log_name == "HWMONITORA":
             num_measurements = int(parts[0])
             assert num_measurements * 2 + 1 == len(parts), (num_measurements, len(parts))
@@ -367,9 +515,11 @@ def gps(name, output, running, lock, nice):
                     data["BOOT_TIMEOUTS"] += 1
                     continue
                 
+                # Add hardware flow control
                 list(gps_command(ser, "SERIALCONFIG", "THISPORT", str(GPS_BAUDRATE), "N", "8", "1", "N", "ON"))
                 time.sleep(0.100)
                 ser.baudrate = GPS_BAUDRATE
+                ser.setRTS(True)
                 _ = ser.read(256)
                 log_buffer = bytearray()
                 
@@ -406,11 +556,10 @@ def gps(name, output, running, lock, nice):
         
         except serial.SerialException as e:
             output.put(f"GPS_FATAL_SERIAL_ERROR: {str(e)}")
-            time.sleep(5) # Wait before retrying to prevent rapid failures
+            time.sleep(5)
         except Exception as e:
             output.put(f"GPS_UNHANDLED_ERROR: {str(e)}")
             time.sleep(5)
-
 
 ######################################################################
 #                   MAIN
